@@ -6,6 +6,7 @@ use actix_web::{
     delete, get, patch, post, web,
 };
 use chrono::Utc;
+#[cfg(debug_assertions)]
 use env_logger::Env;
 use prax_orm::{Model, PraxClient, client};
 use prax_postgres::{PgEngine, PgPool, PgPoolBuilder};
@@ -299,7 +300,8 @@ async fn delete_todo(
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    env_logger::init_from_env(Env::default().default_filter_or("info"));
+    #[cfg(debug_assertions)]
+    env_logger::init_from_env(Env::default().default_filter_or("debug"));
 
     dotenvy::dotenv().ok();
 
