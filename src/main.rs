@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 #[derive(Model, Debug, Serialize, Deserialize)]
-#[prax(table = "todos")]
+#[prax(table = "todo")]
 struct Todo {
     #[prax(unique, id)]
     id: uuid::Uuid,
@@ -314,10 +314,10 @@ async fn main() -> std::io::Result<()> {
 
     let conn = pool.get().await.map_err(std::io::Error::other)?;
 
-    conn.batch_execute("DROP TABLE IF EXISTS todos").await.map_err(std::io::Error::other)?;
+    conn.batch_execute("DROP TABLE IF EXISTS todo").await.map_err(std::io::Error::other)?;
     conn.batch_execute(
         r#"
-    CREATE TABLE IF NOT EXISTS todos (
+    CREATE TABLE IF NOT EXISTS todo (
         id UUID PRIMARY KEY,
         title TEXT NOT NULL,
         completed BOOLEAN NOT NULL DEFAULT FALSE,
