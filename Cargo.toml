@@ -23,8 +23,8 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = "symbols"
-debug = true
-incremental = true
+debug = false
+incremental = false
 overflow-checks = false
 
 [profile.release.package."*"]
