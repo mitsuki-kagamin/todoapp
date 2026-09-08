@@ -24,7 +24,7 @@ codegen-units = 1
 panic = "abort"
 strip = "symbols"
 debug = true
-incremental = false
+incremental = true
 overflow-checks = false
 
 [profile.release.package."*"]

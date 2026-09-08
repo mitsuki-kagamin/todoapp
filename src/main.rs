@@ -146,10 +146,10 @@ async fn get_by_id(
     let id = path.into_inner().0;
 
     if let Some(todo) = cache.load().get(&id).cloned() {
-        return Ok(Json(*todo));
+        return Ok(Json(<Todo as Clone>::clone(&*todo)));
     }
 
-    let uuid = uuid::Uuid::try_from(id).map_err(|e| ErrorResp { error: ErrorBody { code: ErrorCode::InvalidRequest, message: "invalid request".to_string() } })?;
+    let uuid = uuid::Uuid::try_from(id).map_err(|_| ErrorResp { error: ErrorBody { code: ErrorCode::InvalidRequest, message: "invalid request".to_string() } })?;
 
     let todo = db_client
         .todo()
@@ -350,7 +350,7 @@ async fn main() -> std::io::Result<()> {
     let cache_worker_ch = tokio::sync::mpsc::channel(16 * 1024);
     let (tx, rx) = cache_worker_ch;
 
-    tokio::spawn((|| cache_worker(cache.clone(), rx))());
+    tokio::spawn(cache_worker(cache.clone(), rx));
 
     HttpServer::new(move || {
         App::new()
