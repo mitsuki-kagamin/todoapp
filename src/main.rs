@@ -314,7 +314,6 @@ async fn main() -> std::io::Result<()> {
 
     let conn = pool.get().await.map_err(std::io::Error::other)?;
 
-    conn.batch_execute("DROP TABLE IF EXISTS todo").await.map_err(std::io::Error::other)?;
     conn.batch_execute(
         r#"
     CREATE TABLE IF NOT EXISTS todo (
