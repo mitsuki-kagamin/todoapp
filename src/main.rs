@@ -2,9 +2,10 @@ use actix_web::http::StatusCode;
 use actix_web::middleware::Logger;
 use actix_web::web::Json;
 use actix_web::{
-    App, HttpResponse, HttpServer, Responder, ResponseError,
-    delete, get, patch, post, web,
+    App, HttpResponse, HttpServer, Responder, ResponseError, delete, get, patch, post, web,
 };
+use ahash::AHashMap;
+use arc_swap::ArcSwap;
 use chrono::Utc;
 #[cfg(debug_assertions)]
 use env_logger::Env;
@@ -13,8 +14,11 @@ use prax_postgres::{PgEngine, PgPool, PgPoolBuilder};
 use prax_query::{ErrorCode as PraxErrorCode, OrderByField};
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::sync::Arc;
 
-#[derive(Model, Debug, Serialize, Deserialize)]
+type Cache = Arc<ArcSwap<AHashMap<uuid::Uuid, Todo>>>;
+
+#[derive(Model, Debug, Serialize, Deserialize, Clone)]
 #[prax(table = "todo")]
 struct Todo {
     #[prax(unique, id)]
@@ -121,9 +125,7 @@ impl ResponseError for ErrorResp {
 }
 
 #[get("/todos")]
-async fn get_all(
-    db_client: web::Data<PraxClient<PgEngine>>,
-) -> Result<impl Responder, ErrorResp> {
+async fn get_all(db_client: web::Data<PraxClient<PgEngine>>) -> Result<impl Responder, ErrorResp> {
     let todos = db_client
         .todo()
         .find_many()
@@ -139,8 +141,14 @@ async fn get_all(
 async fn get_by_id(
     path: web::Path<(uuid::Uuid,)>,
     db_client: web::Data<PraxClient<PgEngine>>,
+    cache: web::Data<Cache>,
+    cache_writer: web::Data<tokio::sync::mpsc::Sender<Todo>>,
 ) -> Result<Json<Todo>, ErrorResp> {
     let id = path.into_inner().0;
+
+    if let Some(cached_data) = cache.load().get(&id).cloned() {
+        return Ok(Json(cached_data));
+    }
 
     let todo = db_client
         .todo()
@@ -150,6 +158,8 @@ async fn get_by_id(
         .await
         .map_err(|e| ErrorResp::internal(e.to_string()))?
         .ok_or_else(ErrorResp::not_found)?;
+
+    let _ = cache_writer.send(todo.clone()).await;
 
     Ok(Json(todo))
 }
@@ -191,12 +201,12 @@ async fn patch_todo(
     let id = path.into_inner().0;
 
     if data.title.is_none() && data.completed.is_none() {
-        return Err(ErrorResp::invalid(
-            "at least one field must be provided",
-        ));
+        return Err(ErrorResp::invalid("at least one field must be provided"));
     }
 
-    if let Some(title) = &data.title && title.trim().is_empty() {
+    if let Some(title) = &data.title
+        && title.trim().is_empty()
+    {
         return Err(ErrorResp::invalid("title must not be empty"));
     }
 
@@ -255,16 +265,12 @@ async fn patch_todo(
 
     match result {
         Ok(records) => {
-            let todo = records
-                .first()
-                .ok_or_else(ErrorResp::not_found)?;
+            let todo = records.first().ok_or_else(ErrorResp::not_found)?;
 
             Ok(HttpResponse::Ok().json(todo))
         }
 
-        Err(e) if e.code == PraxErrorCode::RecordNotFound => {
-            Err(ErrorResp::not_found())
-        }
+        Err(e) if e.code == PraxErrorCode::RecordNotFound => Err(ErrorResp::not_found()),
 
         Err(e) => Err(ErrorResp::internal(e.message)),
     }
@@ -290,11 +296,19 @@ async fn delete_todo(
     match result {
         Ok(_) => Ok(HttpResponse::NoContent().finish()),
 
-        Err(e) if e.code == PraxErrorCode::RecordNotFound => {
-            Err(ErrorResp::not_found())
-        }
+        Err(e) if e.code == PraxErrorCode::RecordNotFound => Err(ErrorResp::not_found()),
 
         Err(e) => Err(ErrorResp::internal(e.message)),
+    }
+}
+
+async fn cache_worker(cache: Cache, mut rx: tokio::sync::mpsc::Receiver<Todo>) {
+    while let Some(data) = rx.recv().await {
+        let mut new_cache = (**cache.load()).clone();
+
+        new_cache.insert(data.id, data);
+
+        cache.store(Arc::new(new_cache));
     }
 }
 
@@ -305,8 +319,7 @@ async fn main() -> std::io::Result<()> {
 
     dotenvy::dotenv().ok();
 
-    let database_url = std::env::var("POSTGRES_URL")
-        .expect("POSTGRES_URL must be set in .env");
+    let database_url = std::env::var("POSTGRES_URL").expect("POSTGRES_URL must be set in .env");
 
     let pool: PgPool = PgPoolBuilder::new()
         .url(database_url)
@@ -327,21 +340,30 @@ async fn main() -> std::io::Result<()> {
     )
     "#,
     )
-        .await.map_err(std::io::Error::other)?;
+    .await
+    .map_err(std::io::Error::other)?;
 
     let client = PraxClient::new(PgEngine::new(pool));
+
+    let cache = Arc::new(ArcSwap::new(Arc::new(AHashMap::new())));
+    let cache_worker_ch = tokio::sync::mpsc::channel(16 * 1024);
+    let (tx, rx) = cache_worker_ch;
+
+    tokio::spawn((|| cache_worker(cache.clone(), rx))());
 
     HttpServer::new(move || {
         App::new()
             .app_data(web::Data::new(client.clone()))
             .service(get_all)
-            .service(get_by_id)
             .service(create_todo)
             .service(patch_todo)
             .service(delete_todo)
             .wrap(Logger::default())
+            .app_data(web::Data::new(cache.clone()))
+            .app_data(web::Data::new(tx.clone()))
+            .service(get_by_id)
     })
-        .bind(("127.0.0.1", 8080))?
-        .run()
-        .await
+    .bind(("127.0.0.1", 8080))?
+    .run()
+    .await
 }
