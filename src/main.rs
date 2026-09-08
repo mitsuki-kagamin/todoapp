@@ -15,8 +15,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::thread::available_parallelism;
 
-type Cache =
-Arc<ArcSwap<hashbrown::HashMap<uuid::Uuid, Arc<Todo>, foldhash::fast::RandomState>>>;
+type Cache = Arc<ArcSwap<hashbrown::HashMap<uuid::Uuid, Arc<Todo>, foldhash::fast::RandomState>>>;
 
 #[derive(Model, Debug, Serialize, Deserialize, Clone)]
 #[prax(table = "todo")]
@@ -308,16 +307,14 @@ async fn main() -> std::io::Result<()> {
     )
     "#,
     )
-        .await
-        .map_err(std::io::Error::other)?;
+    .await
+    .map_err(std::io::Error::other)?;
 
     let client = PraxClient::new(PgEngine::new(pool));
 
-    let cache: Cache = Arc::new(ArcSwap::new(
-        Arc::new(hashbrown::HashMap::with_hasher(
-            foldhash::fast::RandomState::default(),
-        )),
-    ));
+    let cache: Cache = Arc::new(ArcSwap::new(Arc::new(hashbrown::HashMap::with_hasher(
+        foldhash::fast::RandomState::default(),
+    ))));
     let cache_worker_ch = tokio::sync::mpsc::channel(16 * 1024);
     let (tx, rx) = cache_worker_ch;
 
@@ -336,10 +333,10 @@ async fn main() -> std::io::Result<()> {
             .app_data(web::Data::new(tx.clone()))
             .service(get_by_id)
     })
-        .backlog(8096)
-        .max_connections(4096)
-        .workers(usize::from(workers))
-        .bind(("127.0.0.1", 8080))?
-        .run()
-        .await
+    .backlog(8096)
+    .max_connections(4096)
+    .workers(usize::from(workers))
+    .bind(("127.0.0.1", 8080))?
+    .run()
+    .await
 }
