@@ -1,5 +1,4 @@
 use actix_web::http::StatusCode;
-use actix_web::middleware::Logger;
 use actix_web::web::Json;
 use actix_web::{
     App, HttpResponse, HttpServer, Responder, ResponseError, delete, get, patch, post, web,
@@ -16,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::sync::Arc;
 
-type Cache = Arc<ArcSwap<AHashMap<uuid::Uuid, Todo>>>;
+type Cache = Arc<ArcSwap<AHashMap<String, Arc<Todo>>>>;
 
 #[derive(Model, Debug, Serialize, Deserialize, Clone)]
 #[prax(table = "todo")]
@@ -139,21 +138,23 @@ async fn get_all(db_client: web::Data<PraxClient<PgEngine>>) -> Result<impl Resp
 
 #[get("/todos/{id}")]
 async fn get_by_id(
-    path: web::Path<(uuid::Uuid,)>,
+    path: web::Path<(String,)>,
     db_client: web::Data<PraxClient<PgEngine>>,
     cache: web::Data<Cache>,
     cache_writer: web::Data<tokio::sync::mpsc::Sender<Todo>>,
 ) -> Result<Json<Todo>, ErrorResp> {
     let id = path.into_inner().0;
 
-    if let Some(cached_data) = cache.load().get(&id).cloned() {
-        return Ok(Json(cached_data));
+    if let Some(todo) = cache.load().get(&id).cloned() {
+        return Ok(Json(*todo));
     }
+
+    let uuid = uuid::Uuid::try_from(id).map_err(|e| ErrorResp { error: ErrorBody { code: ErrorCode::InvalidRequest, message: "invalid request".to_string() } })?;
 
     let todo = db_client
         .todo()
         .find_first()
-        .r#where(todo::id::equals(id))
+        .r#where(todo::id::equals(uuid))
         .exec()
         .await
         .map_err(|e| ErrorResp::internal(e.to_string()))?
@@ -306,7 +307,7 @@ async fn cache_worker(cache: Cache, mut rx: tokio::sync::mpsc::Receiver<Todo>) {
     while let Some(data) = rx.recv().await {
         let mut new_cache = (**cache.load()).clone();
 
-        new_cache.insert(data.id, data);
+        new_cache.insert(String::from(data.id), Arc::from(data));
 
         cache.store(Arc::new(new_cache));
     }
@@ -340,8 +341,8 @@ async fn main() -> std::io::Result<()> {
     )
     "#,
     )
-    .await
-    .map_err(std::io::Error::other)?;
+        .await
+        .map_err(std::io::Error::other)?;
 
     let client = PraxClient::new(PgEngine::new(pool));
 
@@ -358,12 +359,11 @@ async fn main() -> std::io::Result<()> {
             .service(create_todo)
             .service(patch_todo)
             .service(delete_todo)
-            .wrap(Logger::default())
             .app_data(web::Data::new(cache.clone()))
             .app_data(web::Data::new(tx.clone()))
             .service(get_by_id)
     })
-    .bind(("127.0.0.1", 8080))?
-    .run()
-    .await
+        .bind(("127.0.0.1", 8080))?
+        .run()
+        .await
 }
