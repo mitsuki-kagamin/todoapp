@@ -3,7 +3,6 @@ use actix_web::web::Json;
 use actix_web::{
     App, HttpResponse, HttpServer, Responder, ResponseError, delete, get, patch, post, web,
 };
-use ahash::AHashMap;
 use arc_swap::ArcSwap;
 use chrono::Utc;
 #[cfg(debug_assertions)]
@@ -14,8 +13,10 @@ use prax_query::{ErrorCode as PraxErrorCode, OrderByField};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::sync::Arc;
+use std::thread::available_parallelism;
 
-type Cache = Arc<ArcSwap<AHashMap<String, Arc<Todo>>>>;
+type Cache =
+Arc<ArcSwap<hashbrown::HashMap<uuid::Uuid, Arc<Todo>, foldhash::fast::RandomState>>>;
 
 #[derive(Model, Debug, Serialize, Deserialize, Clone)]
 #[prax(table = "todo")]
@@ -138,23 +139,21 @@ async fn get_all(db_client: web::Data<PraxClient<PgEngine>>) -> Result<impl Resp
 
 #[get("/todos/{id}")]
 async fn get_by_id(
-    path: web::Path<(String,)>,
+    path: web::Path<uuid::Uuid>,
     db_client: web::Data<PraxClient<PgEngine>>,
     cache: web::Data<Cache>,
     cache_writer: web::Data<tokio::sync::mpsc::Sender<Todo>>,
 ) -> Result<Json<Todo>, ErrorResp> {
-    let id = path.into_inner().0;
+    let id = path.into_inner();
 
     if let Some(todo) = cache.load().get(&id).cloned() {
         return Ok(Json(<Todo as Clone>::clone(&*todo)));
     }
 
-    let uuid = uuid::Uuid::try_from(id).map_err(|_| ErrorResp { error: ErrorBody { code: ErrorCode::InvalidRequest, message: "invalid request".to_string() } })?;
-
     let todo = db_client
         .todo()
         .find_first()
-        .r#where(todo::id::equals(uuid))
+        .r#where(todo::id::equals(id))
         .exec()
         .await
         .map_err(|e| ErrorResp::internal(e.to_string()))?
@@ -213,56 +212,21 @@ async fn patch_todo(
 
     let updated_at = Utc::now();
 
-    let result = match (&data.title, data.completed) {
-        (Some(title), Some(completed)) => {
-            let title = title.trim().to_string();
+    let result = db_client
+        .transaction(move |tx| async move {
+            let mut query = tx.todo().update().r#where(todo::id::equals(id));
 
-            db_client
-                .transaction(move |tx| async move {
-                    tx.todo()
-                        .update()
-                        .r#where(todo::id::equals(id))
-                        .set("title", title)
-                        .set("completed", completed)
-                        .set("updated_at", updated_at)
-                        .exec()
-                        .await
-                })
-                .await
-        }
+            if let Some(ref title) = data.title {
+                query = query.set("title", title.trim().to_owned());
+            }
 
-        (Some(title), None) => {
-            let title = title.trim().to_string();
+            if let Some(completed) = data.completed {
+                query = query.set("completed", completed);
+            }
 
-            db_client
-                .transaction(move |tx| async move {
-                    tx.todo()
-                        .update()
-                        .r#where(todo::id::equals(id))
-                        .set("title", title)
-                        .set("updated_at", updated_at)
-                        .exec()
-                        .await
-                })
-                .await
-        }
-
-        (None, Some(completed)) => {
-            db_client
-                .transaction(move |tx| async move {
-                    tx.todo()
-                        .update()
-                        .r#where(todo::id::equals(id))
-                        .set("completed", completed)
-                        .set("updated_at", updated_at)
-                        .exec()
-                        .await
-                })
-                .await
-        }
-
-        (None, None) => unreachable!(),
-    };
+            query.set("updated_at", updated_at).exec().await
+        })
+        .await;
 
     match result {
         Ok(records) => {
@@ -279,10 +243,10 @@ async fn patch_todo(
 
 #[delete("/todos/{id}")]
 async fn delete_todo(
-    path: web::Path<(uuid::Uuid,)>,
+    path: web::Path<uuid::Uuid>,
     db_client: web::Data<PraxClient<PgEngine>>,
 ) -> Result<impl Responder, ErrorResp> {
-    let id = path.into_inner().0;
+    let id = path.into_inner();
 
     let result = db_client
         .transaction(move |tx| async move {
@@ -304,10 +268,12 @@ async fn delete_todo(
 }
 
 async fn cache_worker(cache: Cache, mut rx: tokio::sync::mpsc::Receiver<Todo>) {
+    println!("Cache worker succesfully started!");
+
     while let Some(data) = rx.recv().await {
         let mut new_cache = (**cache.load()).clone();
 
-        new_cache.insert(String::from(data.id), Arc::from(data));
+        new_cache.insert(data.id, Arc::from(data));
 
         cache.store(Arc::new(new_cache));
     }
@@ -319,6 +285,7 @@ async fn main() -> std::io::Result<()> {
     env_logger::init_from_env(Env::default().default_filter_or("debug"));
 
     dotenvy::dotenv().ok();
+    let workers = available_parallelism()?;
 
     let database_url = std::env::var("POSTGRES_URL").expect("POSTGRES_URL must be set in .env");
 
@@ -346,11 +313,17 @@ async fn main() -> std::io::Result<()> {
 
     let client = PraxClient::new(PgEngine::new(pool));
 
-    let cache = Arc::new(ArcSwap::new(Arc::new(AHashMap::new())));
+    let cache: Cache = Arc::new(ArcSwap::new(
+        Arc::new(hashbrown::HashMap::with_hasher(
+            foldhash::fast::RandomState::default(),
+        )),
+    ));
     let cache_worker_ch = tokio::sync::mpsc::channel(16 * 1024);
     let (tx, rx) = cache_worker_ch;
 
     tokio::spawn(cache_worker(cache.clone(), rx));
+
+    println!("Server spawned!");
 
     HttpServer::new(move || {
         App::new()
@@ -363,6 +336,9 @@ async fn main() -> std::io::Result<()> {
             .app_data(web::Data::new(tx.clone()))
             .service(get_by_id)
     })
+        .backlog(8096)
+        .max_connections(4096)
+        .workers(usize::from(workers))
         .bind(("127.0.0.1", 8080))?
         .run()
         .await

@@ -10,22 +10,23 @@ prax-orm = "0.12.0"
 prax-postgres = "0.12.0"
 prax-query = "0.12.0"
 serde = { version = "1.0.229", features = ["derive"] }
-uuid = "1.26.0"
 env_logger = "0.11.11"
 dotenvy = "0.15.7"
-ahash = "0.8.12"
 tokio = { version = "1.53.1", features = ["sync"] }
 arc-swap = "1.9.2"
+uuid = { version = "1.26.0", features = ["zerocopy", "fast-rng"] }
+hashbrown = { version = "0.17.1", features = ["rayon"] }
+foldhash = "0.2.0"
 
-[profile.release]
-opt-level = 3
-lto = "fat"
-codegen-units = 1
-panic = "abort"
-strip = "symbols"
-debug = false
-incremental = false
-overflow-checks = false
-
-[profile.release.package."*"]
-opt-level = 3
+#[profile.release]
+#opt-level = 3
+#lto = "fat"
+#codegen-units = 1
+#panic = "abort"
+#strip = "symbols"
+#debug = false
+#incremental = false
+#overflow-checks = false
+#
+#[profile.release.package."*"]
+#opt-level = 3
