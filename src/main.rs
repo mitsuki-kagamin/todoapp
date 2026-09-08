@@ -297,14 +297,17 @@ async fn delete_todo(
     }
 }
 
-#[dotenvy::load]
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     env_logger::init_from_env(Env::default().default_filter_or("info"));
 
+    dotenvy::dotenv().ok();
+
+    let database_url = std::env::var("POSTGRES_URL")
+        .expect("POSTGRES_URL must be set in .env");
 
     let pool: PgPool = PgPoolBuilder::new()
-        .url(std::env::var("POSTGRES_URL").unwrap())
+        .url(database_url)
         .build()
         .await
         .map_err(std::io::Error::other)?;
