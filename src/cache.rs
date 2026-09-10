@@ -23,7 +23,18 @@ pub struct Cache {
 
 struct HotEntry {
     id: Uuid,
+    /// Canonical lowercase-hyphenated ASCII form of `id`, so an L1 check can
+    /// memcmp the raw path bytes straight off the wire instead of decoding
+    /// hex first - decode only matters once we fall through to L2 (needs the
+    /// binary value to fold into a hash key) or the DB (needs a real `Uuid`).
+    id_ascii: [u8; 36],
     body: Bytes,
+}
+
+fn encode_ascii(id: Uuid) -> [u8; 36] {
+    let mut buf = [0u8; 36];
+    id.hyphenated().encode_lower(&mut buf);
+    buf
 }
 
 /// What a task wants done - `FillL1`/`Write` from `api_reference.md`'s
@@ -53,10 +64,15 @@ impl Cache {
         }
     }
 
-    pub fn get_hot(&self, id: Uuid) -> Option<Bytes> {
+    /// L1 check straight off the raw path bytes - `id_str` is expected to be
+    /// the 36-byte canonical form, but any mismatch (including a
+    /// differently-cased or malformed id) just misses here and falls
+    /// through to the parsed-`Uuid` path below, which is the one place that
+    /// actually validates the format.
+    pub fn get_hot_raw(&self, id_str: &str) -> Option<Bytes> {
         let guard = self.hot.load();
         let entry = guard.as_deref()?;
-        (entry.id == id).then(|| entry.body.clone())
+        (entry.id_ascii.as_slice() == id_str.as_bytes()).then(|| entry.body.clone())
     }
 
     pub fn get_warm(&self, id: Uuid) -> Option<Bytes> {
@@ -89,7 +105,11 @@ impl Cache {
     }
 
     fn promote(&self, id: Uuid, body: Bytes) {
-        self.hot.store(Some(Arc::new(HotEntry { id, body })));
+        self.hot.store(Some(Arc::new(HotEntry {
+            id,
+            id_ascii: encode_ascii(id),
+            body,
+        })));
     }
 
     fn fill(&self, id: Uuid, body: Bytes) {

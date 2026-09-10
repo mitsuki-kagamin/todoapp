@@ -182,13 +182,19 @@ async fn route(head: &http::Head, body: &[u8], state: &Arc<AppState>, out: &mut 
 
     if let Some(rest) = path.strip_prefix("/todos/") {
         if !rest.is_empty() && !rest.contains('/') {
+            // GET checks the raw path bytes against L1 before parsing
+            // anything - see `Cache::get_hot_raw`. PATCH/DELETE always need
+            // a real `Uuid` for the DB call, so they parse up front.
+            if head.method == Method::Get {
+                return get_todo(rest, state, out).await;
+            }
+
             let id = match parse_uuid_fast(rest) {
                 Some(id) => id,
                 None => return bad_request(out, "id must be a valid UUID"),
             };
 
             return match head.method {
-                Method::Get => get_todo(id, state, out).await,
                 Method::Patch => patch_todo(id, body, state, out).await,
                 Method::Delete => delete_todo(id, state, out).await,
                 _ => not_found(out),
@@ -292,12 +298,20 @@ async fn create_todo(body: &[u8], state: &Arc<AppState>, out: &mut Vec<u8>) {
     }
 }
 
-async fn get_todo(id: Uuid, state: &Arc<AppState>, out: &mut Vec<u8>) {
-    let hot = state.cache.get_hot(id);
+async fn get_todo(id_str: &str, state: &Arc<AppState>, out: &mut Vec<u8>) {
+    // Straight memcmp against the raw path bytes, no hex decode - see
+    // `Cache::get_hot_raw`. This is the path every request on `test.js`
+    // takes after the first.
+    let hot = state.cache.get_hot_raw(id_str);
     if std::hint::likely(hot.is_some()) {
         http::write_json_response(out, 200, &hot.unwrap(), &[]);
         return;
     }
+
+    let id = match parse_uuid_fast(id_str) {
+        Some(id) => id,
+        None => return bad_request(out, "id must be a valid UUID"),
+    };
 
     if let Some(body) = state.cache.get_warm(id) {
         state
