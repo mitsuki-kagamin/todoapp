@@ -1,0 +1,279 @@
+use std::io;
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+use bytes::Bytes;
+use compio::buf::BufResult;
+use compio::io::{AsyncRead, AsyncWriteExt};
+use compio::net::{TcpListener, TcpSocket, TcpStream};
+use uuid::Uuid;
+
+use crate::cache::Cache;
+use crate::http::{self, Method};
+use crate::store::Store;
+use crate::types::{CreateTodo, ErrorResp, PatchTodo, Todo};
+
+pub struct AppState {
+    pub store: Store,
+    pub cache: Cache,
+}
+
+impl AppState {
+    pub fn new() -> Self {
+        Self {
+            store: Store::new(),
+            cache: Cache::new(),
+        }
+    }
+}
+
+/// One `compio` runtime per OS thread, all sharing one port via
+/// `SO_REUSEPORT` - the usual thread-per-core layout for this kind of
+/// completion-based runtime.
+pub async fn run(addr: SocketAddr, state: Arc<AppState>) -> io::Result<()> {
+    let listener = bind_reuseport(addr).await?;
+
+    loop {
+        let (stream, _peer) = listener.accept().await?;
+        let state = state.clone();
+        compio::runtime::spawn(async move {
+            handle_connection(stream, state).await;
+        })
+        .detach();
+    }
+}
+
+async fn bind_reuseport(addr: SocketAddr) -> io::Result<TcpListener> {
+    let socket = match addr {
+        SocketAddr::V4(_) => TcpSocket::new_v4().await?,
+        SocketAddr::V6(_) => TcpSocket::new_v6().await?,
+    };
+    socket.set_reuseport(true)?;
+    socket.set_reuseaddr(true)?;
+    socket.bind(addr).await?;
+    socket.listen(1024).await
+}
+
+/// A connection's unread bytes, accumulated across reads. Kept deliberately
+/// simple (own the bytes, don't fight `compio`'s owned-buffer read API for
+/// incremental in-place growth) over squeezing out the last copy.
+struct Conn {
+    stream: TcpStream,
+    buf: Vec<u8>,
+    scratch: Vec<u8>,
+}
+
+const SCRATCH_SIZE: usize = 8 * 1024;
+
+impl Conn {
+    fn new(stream: TcpStream) -> Self {
+        Self {
+            stream,
+            buf: Vec::with_capacity(SCRATCH_SIZE),
+            scratch: Vec::with_capacity(SCRATCH_SIZE),
+        }
+    }
+
+    /// Reads more bytes from the socket into `self.buf`. `Ok(false)` means EOF.
+    async fn read_more(&mut self) -> io::Result<bool> {
+        let mut scratch = std::mem::take(&mut self.scratch);
+        if scratch.capacity() == 0 {
+            scratch = Vec::with_capacity(SCRATCH_SIZE);
+        }
+
+        let BufResult(res, mut scratch) = self.stream.read(scratch).await;
+        let n = res?;
+        if n == 0 {
+            self.scratch = scratch;
+            return Ok(false);
+        }
+
+        self.buf.extend_from_slice(&scratch);
+        scratch.clear();
+        self.scratch = scratch;
+        Ok(true)
+    }
+
+    /// Reads the next request head, if any. `Ok(None)` means the peer closed
+    /// the connection cleanly between requests.
+    async fn read_head(&mut self) -> io::Result<Option<http::Head>> {
+        loop {
+            match http::try_parse(&self.buf) {
+                Ok(Some(head)) => {
+                    self.buf.drain(..head.head_len);
+                    return Ok(Some(head));
+                }
+                Ok(None) => {
+                    if !self.read_more().await? {
+                        if self.buf.is_empty() {
+                            return Ok(None);
+                        }
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "connection closed mid-request",
+                        ));
+                    }
+                }
+                Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e)),
+            }
+        }
+    }
+
+    async fn read_body(&mut self, len: usize) -> io::Result<Vec<u8>> {
+        while self.buf.len() < len {
+            if !self.read_more().await? {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "connection closed while reading body",
+                ));
+            }
+        }
+        Ok(self.buf.drain(..len).collect())
+    }
+
+    async fn write_response(&mut self, resp: Vec<u8>) -> io::Result<()> {
+        let BufResult(res, _buf) = self.stream.write_all(resp).await;
+        res
+    }
+}
+
+async fn handle_connection(stream: TcpStream, state: Arc<AppState>) {
+    stream.set_nodelay(true).ok();
+    let mut conn = Conn::new(stream);
+
+    loop {
+        let head = match conn.read_head().await {
+            Ok(Some(head)) => head,
+            Ok(None) => return,
+            Err(_) => return,
+        };
+
+        let body = match conn.read_body(head.content_length).await {
+            Ok(body) => body,
+            Err(_) => return,
+        };
+
+        let response = route(&head, &body, &state);
+        if conn.write_response(response).await.is_err() {
+            return;
+        }
+    }
+}
+
+fn route(head: &http::Head, body: &[u8], state: &AppState) -> Vec<u8> {
+    let path = head.path.split('?').next().unwrap_or("/");
+
+    if path == "/todos" {
+        return match head.method {
+            Method::Get => list_todos(state),
+            Method::Post => create_todo(body, state),
+            _ => not_found(),
+        };
+    }
+
+    if let Some(rest) = path.strip_prefix("/todos/") {
+        if !rest.is_empty() && !rest.contains('/') {
+            let id = match Uuid::parse_str(rest) {
+                Ok(id) => id,
+                Err(_) => return bad_request("id must be a valid UUID"),
+            };
+
+            return match head.method {
+                Method::Get => get_todo(id, state),
+                Method::Patch => patch_todo(id, body, state),
+                Method::Delete => delete_todo(id, state),
+                _ => not_found(),
+            };
+        }
+    }
+
+    not_found()
+}
+
+fn list_todos(state: &AppState) -> Vec<u8> {
+    let items = state.store.list();
+    let body = sonic_rs::to_vec(&items).unwrap_or_default();
+    http::json_response(200, &body, &[])
+}
+
+fn create_todo(body: &[u8], state: &AppState) -> Vec<u8> {
+    let payload: CreateTodo = match sonic_rs::from_slice(body) {
+        Ok(payload) => payload,
+        Err(_) => return bad_request("invalid request body"),
+    };
+
+    if payload.title.trim().is_empty() {
+        return bad_request("title must not be empty");
+    }
+
+    let todo = state.store.insert(Todo::new(payload.title));
+    let encoded = sonic_rs::to_vec(&*todo).unwrap_or_default();
+    state.cache.fill(todo.id, Bytes::from(encoded.clone()));
+
+    let location = format!("/todos/{}", todo.id);
+    http::json_response(201, &encoded, &[("Location", &location)])
+}
+
+fn get_todo(id: Uuid, state: &AppState) -> Vec<u8> {
+    if let Some(body) = state.cache.get_hot(id) {
+        return http::json_response(200, &body, &[]);
+    }
+
+    if let Some(body) = state.cache.get_warm(id) {
+        state.cache.promote(id, body.clone());
+        return http::json_response(200, &body, &[]);
+    }
+
+    match state.store.get(id) {
+        Some(todo) => {
+            let encoded = Bytes::from(sonic_rs::to_vec(&*todo).unwrap_or_default());
+            state.cache.fill(id, encoded.clone());
+            http::json_response(200, &encoded, &[])
+        }
+        None => not_found(),
+    }
+}
+
+fn patch_todo(id: Uuid, body: &[u8], state: &AppState) -> Vec<u8> {
+    let payload: PatchTodo = match sonic_rs::from_slice(body) {
+        Ok(payload) => payload,
+        Err(_) => return bad_request("invalid request body"),
+    };
+
+    if let Some(ref title) = payload.title {
+        if title.trim().is_empty() {
+            return bad_request("title must not be empty");
+        }
+    }
+
+    match state.store.patch(id, payload.title, payload.completed) {
+        Some(todo) => {
+            let encoded = Bytes::from(sonic_rs::to_vec(&*todo).unwrap_or_default());
+            state.cache.fill(id, encoded.clone());
+            http::json_response(200, &encoded, &[])
+        }
+        None => {
+            state.cache.invalidate(id);
+            not_found()
+        }
+    }
+}
+
+fn delete_todo(id: Uuid, state: &AppState) -> Vec<u8> {
+    if state.store.delete(id) {
+        state.cache.invalidate(id);
+        http::empty_response(204)
+    } else {
+        not_found()
+    }
+}
+
+fn not_found() -> Vec<u8> {
+    let body = sonic_rs::to_vec(&ErrorResp::not_found()).unwrap_or_default();
+    http::json_response(404, &body, &[])
+}
+
+fn bad_request(message: &str) -> Vec<u8> {
+    let body = sonic_rs::to_vec(&ErrorResp::invalid(message)).unwrap_or_default();
+    http::json_response(400, &body, &[])
+}

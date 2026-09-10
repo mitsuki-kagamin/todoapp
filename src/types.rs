@@ -1,42 +1,57 @@
-use actix_web::http::StatusCode;
-use actix_web::{HttpResponse, ResponseError};
-use prax_orm::{Model, client};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::fmt;
+use uuid::Uuid;
 
-#[derive(Model, Debug, Serialize, Deserialize, Clone, Default)]
-#[prax(table = "todo")]
-#[serde(rename_all(serialize = "camelCase"))]
-#[repr(align(64))]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Todo {
-    #[prax(unique, id)]
-    pub id: uuid::Uuid,
-
+    pub id: Uuid,
     pub title: String,
-
-    #[prax(default = "false")]
     pub completed: bool,
-
-    pub created_at: i64,
-    pub updated_at: i64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
-client!(Todo);
+impl Todo {
+    pub fn new(title: String) -> Self {
+        let now = Utc::now();
+        Self {
+            id: Uuid::new_v4(),
+            title,
+            completed: false,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+}
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Debug, Deserialize)]
+pub struct CreateTodo {
+    pub title: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct PatchTodo {
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub completed: Option<bool>,
+}
+
+#[derive(Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ErrorCode {
     TodoNotFound,
-    InternalError,
+    InvalidRequest,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize)]
 pub struct ErrorBody {
     pub code: ErrorCode,
     pub message: String,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize)]
 pub struct ErrorResp {
     pub error: ErrorBody,
 }
@@ -51,31 +66,12 @@ impl ErrorResp {
         }
     }
 
-    pub fn internal(message: impl Into<String>) -> Self {
+    pub fn invalid(message: impl Into<String>) -> Self {
         Self {
             error: ErrorBody {
-                code: ErrorCode::InternalError,
+                code: ErrorCode::InvalidRequest,
                 message: message.into(),
             },
         }
-    }
-}
-
-impl fmt::Display for ErrorResp {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.error.message)
-    }
-}
-
-impl ResponseError for ErrorResp {
-    fn status_code(&self) -> StatusCode {
-        match self.error.code {
-            ErrorCode::TodoNotFound => StatusCode::NOT_FOUND,
-            ErrorCode::InternalError => StatusCode::INTERNAL_SERVER_ERROR,
-        }
-    }
-
-    fn error_response(&self) -> HttpResponse {
-        HttpResponse::build(self.status_code()).json(self)
     }
 }
