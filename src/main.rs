@@ -1,7 +1,3 @@
-compile_error!(
-    "i have mental issues and can't make this code work (and cant write in english, lol (sorry)). maybe later i finally rewrite this..."
-);
-
 use std::error::Error;
 use std::io::{self, Read, Write};
 use std::ops::Shr;
@@ -164,3 +160,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 }
+
+compile_error!(
+    "i have mental issues and can't make this code work (and cant write in english, lol (sorry)).
+    maybe later i finally rewrite this...
+
+    small explain: i KNOW how make this works, but...,
+    some bad things hapenned in my life. sorry.
+    i cant do this right now..
+    "
+);
