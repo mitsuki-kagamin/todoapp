@@ -1,3 +1,5 @@
+#![feature(likely_unlikely)]
+
 mod cache;
 mod db;
 mod http;

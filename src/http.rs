@@ -1,5 +1,3 @@
-use std::io::Write;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Method {
     Get,
@@ -69,25 +67,32 @@ fn status_line(code: u16) -> &'static str {
     }
 }
 
-/// Builds a `Connection: keep-alive` response carrying a JSON body.
-pub fn json_response(code: u16, body: &[u8], extra_headers: &[(&str, &str)]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(160 + body.len());
+/// Writes a `Connection: keep-alive` response carrying a JSON body into
+/// `out`. Takes the buffer by reference instead of allocating one - callers
+/// reuse the same `Vec` for every response on a connection (see
+/// `Conn::write_response` in `server.rs`), so the only allocation left on
+/// the hot path is growing that buffer the first few times it's used.
+pub fn write_json_response(out: &mut Vec<u8>, code: u16, body: &[u8], extra_headers: &[(&str, &str)]) {
     out.extend_from_slice(status_line(code).as_bytes());
     out.extend_from_slice(b"Content-Type: application/json\r\n");
     out.extend_from_slice(b"Connection: keep-alive\r\n");
     for (name, value) in extra_headers {
-        write!(out, "{name}: {value}\r\n").unwrap();
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(b": ");
+        out.extend_from_slice(value.as_bytes());
+        out.extend_from_slice(b"\r\n");
     }
-    write!(out, "Content-Length: {}\r\n\r\n", body.len()).unwrap();
+    out.extend_from_slice(b"Content-Length: ");
+    // itoa over `write!`: no `core::fmt` machinery, no formatting flags to
+    // interpret, just digits straight into the buffer.
+    out.extend_from_slice(itoa::Buffer::new().format(body.len()).as_bytes());
+    out.extend_from_slice(b"\r\n\r\n");
     out.extend_from_slice(body);
-    out
 }
 
-/// Builds a bodyless keep-alive response (e.g. `204 No Content`).
-pub fn empty_response(code: u16) -> Vec<u8> {
-    let mut out = Vec::with_capacity(64);
+/// Writes a bodyless keep-alive response (e.g. `204 No Content`) into `out`.
+pub fn write_empty_response(out: &mut Vec<u8>, code: u16) {
     out.extend_from_slice(status_line(code).as_bytes());
     out.extend_from_slice(b"Connection: keep-alive\r\n");
     out.extend_from_slice(b"Content-Length: 0\r\n\r\n");
-    out
 }

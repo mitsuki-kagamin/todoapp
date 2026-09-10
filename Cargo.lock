@@ -1714,6 +1714,7 @@ dependencies = [
  "flume",
  "hashbrown",
  "httparse",
+ "itoa",
  "mimalloc",
  "nohash-hasher",
  "postgres",
