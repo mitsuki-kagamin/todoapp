@@ -1,236 +1,166 @@
-#![feature(likely_unlikely)]
+compile_error!(
+    "i have mental issues and can't make this code work (and cant write in english, lol (sorry)). maybe later i finally rewrite this..."
+);
 
-mod types;
-
-use types::*;
-
-use actix_web::web::Json;
-use actix_web::{App, HttpServer, get, web};
-use arc_swap::ArcSwap;
-#[cfg(debug_assertions)]
-use env_logger::Env;
-use prax_orm::PraxClient;
-
-use prax_postgres::{PgEngine, PgPool, PgPoolBuilder};
-
-use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
-use std::hint::likely;
-use std::sync::Arc;
+use std::error::Error;
+use std::io::{self, Read, Write};
+use std::ops::Shr;
 use std::sync::atomic::{AtomicPtr, Ordering};
-use std::thread::available_parallelism;
 
-pub type SmallCache =
-    Arc<ArcSwap<hashbrown::HashMap<uuid::Uuid, Arc<Json<Todo>>, foldhash::fast::RandomState>>>;
+use mio::net::{TcpListener, TcpStream};
+use mio::{Events, Interest, Poll, Token};
 
-static BigCache: AtomicPtr<Json<Todo>> = AtomicPtr::new(std::ptr::null_mut());
+use std::sync::Arc;
 
-#[get("/todos/{id}")]
-async fn get_by_id(
-    path: web::Path<uuid::Uuid>,
-    db_client: web::Data<PraxClient<PgEngine>>,
-    cache: web::Data<SmallCache>,
-    cache_writer: web::Data<tokio::sync::mpsc::Sender<Todo>>,
-) -> Result<Json<Todo>, ErrorResp> {
-    let id = path.into_inner();
+#[repr(transparent)]
+#[derive(Clone, PartialEq, Eq, Hash)]
+/// Example data:
+///
+/// ```http
+/// HTTP/1.1 200 OK\r\n
+/// Content-Type: application/json\r\n
+/// Content-Length: 137\r\n
+/// \r\n
+/// {"id":"550e8400-e29b-41d4-a716-446655440000","title":"Buy milk","completed":false,"createdAt":"2026-09-08T12:00:00Z","updatedAt":"2026-09-08T12:00:00Z"}
+/// ```
+///
+/// But! Content-Length: from 130B to 161B
+struct TodoJ(bytes::Bytes); // yeah.
 
-    #[cfg(debug_assertions)]
-    dbg!(&id);
+#[repr(transparent)]
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct Uuid(u128);
 
-    let ptr = BigCache.load(Ordering::Relaxed);
+impl PartialEq<[u8; 36]> for TodoJ {
+    fn eq(&self, other: &[u8; 36]) -> bool {
+        self.0.as_ref() == other
+    }
+}
 
-    #[cfg(debug_assertions)]
-    println!("HANDLER BIG CACHE = {:p}", ptr);
+impl PartialEq<TodoJ> for [u8; 36] {
+    fn eq(&self, other: &TodoJ) -> bool {
+        self == other.0.as_ref()
+    }
+}
+
+#[repr(transparent)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct Key(u64);
+
+impl From<Uuid> for Key {
+    #[inline(always)]
+    fn from(uuid: Uuid) -> Self {
+        Self((uuid.0 as u64) ^ (uuid.0 >> 64) as u64)
+    }
+}
+
+static BIG_CACHE: AtomicPtr<TodoJ> = AtomicPtr::new(std::ptr::null_mut());
+
+const PREFIX: &[u8; 11] = b"GET /todos/";
+type BUF<'a> = [u8; 36];
+const SUFFIX: &[u8; 11] = b" HTTP/1.1\r\n";
+
+fn write_to_stream(stream: &mut TcpStream, data: &[u8]) -> io::Result<()> {
+    let mut bytes_written = 0;
+
+    // Loop until the entire slice of data is sent
+    while bytes_written < data.len() {
+        match stream.write(&data[bytes_written..]) {
+            // Success: some bytes were written
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "failed to write any bytes",
+                ));
+            }
+            Ok(n) => {
+                bytes_written += n;
+            }
+            // Error: The system is not ready to take more data right now
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                break;
+                // we are loooooooosseeeers! hell yeah
+            }
+            // Error: The system call was interrupted; try again immediately
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    Ok(())
+}
+
+fn handle_request(ch: *mut TcpStream) {
+    let mut data = [0u8; 58];
+
+    unsafe { ch.read() }.read_exact(&mut data).ok();
+    if &data[0..11] != PREFIX || &data[47..58] != SUFFIX {
+        return drop(ch);
+    }
+
+    let uuid = &data[11..47];
+
+    let ptr = BIG_CACHE.load(Ordering::Relaxed);
 
     if !ptr.is_null() {
-        #[cfg(debug_assertions)]
-        dbg!(Some(()));
-        unsafe {
-            let todo = &*ptr;
-            #[cfg(debug_assertions)]
-            dbg!(todo);
+        let todo = unsafe { &*ptr };
 
-            if likely(todo.0.id == id) {
-                #[cfg(debug_assertions)]
-                dbg!(Some(true));
-                return Ok(Json(todo.0.clone()));
-            } else {
-                #[cfg(debug_assertions)]
-                dbg!(Some(false));
-            }
-        }
-    } else {
-        #[cfg(debug_assertions)]
-        println!("big cache miss");
-    }
+        let toodoo = todo.0.as_ref();
 
-    if let Some(todo) = cache.load().get(&id) {
-        #[cfg(debug_assertions)]
-        dbg!(Some(()));
-        return Ok(Json(todo.0.clone()));
-    } else {
-        #[cfg(debug_assertions)]
-        println!("small cache miss");
-    }
-
-    let todo = db_client
-        .todo()
-        .find_first()
-        .r#where(todo::id::equals(id))
-        .exec()
-        .await
-        .map_err(|e| ErrorResp::internal(e.to_string()))?
-        .ok_or_else(ErrorResp::not_found)?;
-
-    #[cfg(debug_assertions)]
-    dbg!(&todo);
-
-    #[cfg(debug_assertions)]
-    println!("SENDING TO CACHE WORKER: {}", todo.id);
-
-    if let Err(e) = cache_writer.send(todo.clone()).await {
-        eprintln!("CACHE SEND ERROR: {e}");
-    }
-
-    #[cfg(debug_assertions)]
-    println!("SENT TO CACHE WORKER");
-
-    #[cfg(debug_assertions)]
-    dbg!(false);
-
-    Ok(Json(todo))
-}
-
-fn update_cache(newdata: Todo) {
-    let ptr = Box::into_raw(Box::new(Json(newdata)));
-
-    #[cfg(debug_assertions)]
-    println!("PUBLISH BIG CACHE: {ptr:p}");
-
-    BigCache.store(ptr, Ordering::Release);
-
-    #[cfg(debug_assertions)]
-    println!("BIG CACHE NOW: {:p}", BigCache.load(Ordering::Acquire));
-}
-
-async fn cache_worker(cache: SmallCache, mut rx: tokio::sync::mpsc::Receiver<Todo>) {
-    println!("Cache worker succesfully started!");
-
-    while let Some(data) = rx.recv().await {
-        #[cfg(debug_assertions)]
-        println!("WORKER GOT: {}", data.id);
-
-        let mut new_cache = (**cache.load()).clone();
-
-        update_cache(data.clone());
-
-        #[cfg(debug_assertions)]
-        println!(
-            "BIG CACHE AFTER UPDATE: {:p}",
-            BigCache.load(Ordering::Acquire)
-        );
-
-        new_cache.insert(data.id, Arc::new(Json(data)));
-
-        cache.store(Arc::new(new_cache));
-    }
-
-    #[cfg(debug_assertions)]
-    println!("CACHE WORKER EXITED");
-}
-
-#[actix_web::main]
-async fn main() -> std::io::Result<()> {
-    #[cfg(debug_assertions)]
-    env_logger::init_from_env(Env::default().default_filter_or("debug"));
-
-    dotenvy::dotenv().ok();
-    let workers = available_parallelism()?;
-    dbg!(workers);
-
-    let database_url = std::env::var("POSTGRES_URL").expect("POSTGRES_URL must be set in .env");
-    dbg!(&database_url);
-
-    let pool: PgPool = PgPoolBuilder::new()
-        .url(database_url)
-        .build()
-        .await
-        .map_err(std::io::Error::other)?;
-
-    dbg!(pool.status());
-
-    let conn = pool.get().await.map_err(std::io::Error::other)?;
-    println!("conn created");
-
-    conn.batch_execute(
-        r#"
-    CREATE TABLE IF NOT EXISTS todo (
-        id UUID PRIMARY KEY,
-        title TEXT NOT NULL,
-        completed BOOLEAN NOT NULL DEFAULT FALSE,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
-    "#,
-    )
-    .await
-    .map_err(std::io::Error::other)?;
-    println!("table creating pass");
-
-    let uuid = uuid::Uuid::parse_str("a63df501-83fa-4cc6-9c94-8cff1927a6fc")
-        .map_err(std::io::Error::other)?;
-
-    conn.execute(
-        r#"
-        INSERT INTO todo (id, title, completed)
-        VALUES ($1, '', FALSE)
-        ON CONFLICT (id) DO NOTHING
-        "#,
-        &[&uuid],
-    )
-    .await
-    .map_err(std::io::Error::other)?;
-    println!("data creating pass");
-
-    let client = PraxClient::new(PgEngine::new(pool));
-    println!("db client created");
-
-    let cache: SmallCache = Arc::new(ArcSwap::new(Arc::new(hashbrown::HashMap::with_hasher(
-        foldhash::fast::RandomState::default(),
-    ))));
-    dbg!(&cache);
-    let cache_worker_ch = tokio::sync::mpsc::channel(16 * 1024);
-    dbg!(&cache_worker_ch);
-    let (tx, rx) = cache_worker_ch;
-
-    tokio::spawn(cache_worker(cache.clone(), rx));
-
-    std::thread::spawn(|| {
-        loop {
-            let ptr = BigCache.load(Ordering::Relaxed);
-
-            if !ptr.is_null() {
-                unsafe {
-                    _mm_prefetch(ptr as *const i8, _MM_HINT_T0);
+        if toodoo == uuid {
+            unsafe {
+                if let Some(ch) = ch.as_mut() {
+                    write_to_stream(ch, toodoo).ok();
+                    return;
                 }
             }
-
-            std::hint::spin_loop();
         }
-    });
+    }
 
-    println!("Server spawned!");
+    return ();
+}
 
-    HttpServer::new(move || {
-        App::new()
-            .app_data(web::Data::new(client.clone()))
-            .app_data(web::Data::new(cache.clone()))
-            .app_data(web::Data::new(tx.clone()))
-            .service(get_by_id)
-    })
-    .backlog(8 * 1024)
-    .max_connections(4 * 1024)
-    .workers(usize::from(workers) * 2)
-    .bind(("127.0.0.1", 8080))?
-    .run()
-    .await
+// Some tokens to allow us to identify which event is for which socket.
+const SERVER: Token = Token(0);
+
+fn main() -> Result<(), Box<dyn Error>> {
+    // Create a poll instance.
+    let mut poll = Poll::new()?;
+    // Create storage for events.
+    let mut events = Events::with_capacity(128);
+
+    // Setup the server socket.
+    let addr = "127.0.0.1:13265".parse()?;
+    let mut server = TcpListener::bind(addr)?;
+    // Start listening for incoming connections.
+    poll.registry()
+        .register(&mut server, SERVER, Interest::READABLE)?;
+
+    // Start an event loop.
+    loop {
+        // Poll Mio for events, blocking until we get an event.
+        poll.poll(&mut events, None)?;
+
+        // Process each event.
+        for event in events.iter() {
+            // We can use the token we previously provided to `register` to
+            // determine for which socket the event is.
+            match event.token() {
+                SERVER => {
+                    // If this is an event for the server, it means a connection
+                    // is ready to be accepted.
+                    //
+                    // Accept the connection and drop it immediately. This will
+                    // close the socket and notify the client of the EOF.
+                    let connection = server.accept();
+                    drop(connection);
+                }
+
+                // We don't expect any events with tokens other than those we provided.
+                _ => unreachable!(),
+            }
+        }
+    }
 }

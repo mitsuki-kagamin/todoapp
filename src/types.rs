@@ -1,6 +1,5 @@
 use actix_web::http::StatusCode;
 use actix_web::{HttpResponse, ResponseError};
-use chrono::Utc;
 use prax_orm::{Model, client};
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -8,6 +7,7 @@ use std::fmt;
 #[derive(Model, Debug, Serialize, Deserialize, Clone, Default)]
 #[prax(table = "todo")]
 #[serde(rename_all(serialize = "camelCase"))]
+#[repr(align(64))]
 pub struct Todo {
     #[prax(unique, id)]
     pub id: uuid::Uuid,
@@ -17,11 +17,8 @@ pub struct Todo {
     #[prax(default = "false")]
     pub completed: bool,
 
-    #[prax(default = "now()")]
-    pub created_at: chrono::DateTime<Utc>,
-
-    #[prax(default = "now()")]
-    pub updated_at: chrono::DateTime<Utc>,
+    pub created_at: i64,
+    pub updated_at: i64,
 }
 
 client!(Todo);

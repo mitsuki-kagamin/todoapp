@@ -4,19 +4,18 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-actix-web = "4.15.0"
 chrono = "0.4.45"
-prax-orm = "0.12.0"
-prax-postgres = "0.12.0"
-prax-query = "0.12.0"
-serde = { version = "1.0.229", features = ["derive"] }
 env_logger = "0.11.11"
 dotenvy = "0.15.7"
-tokio = { version = "1.53.1", features = ["sync"] }
 arc-swap = "1.9.2"
-uuid = { version = "1.26.0", features = ["zerocopy", "fast-rng"] }
 hashbrown = { version = "0.17.1", features = ["rayon"] }
-foldhash = "0.2.0"
+mimalloc = "0.1.52"
+flume = "0.12.0"
+sonic-rs = "0.5.8"
+postgres = "0.19.14"
+mio = { version = "1.2.3", features = ["net", "os-ext", "os-poll"] }
+bytes = "1.12.1"
+nohash-hasher = "0.2.0"
 
 [profile.release]
 opt-level = 3
