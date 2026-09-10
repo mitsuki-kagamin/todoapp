@@ -7,15 +7,15 @@ use hashbrown::HashMap;
 use nohash_hasher::NoHashHasher;
 use uuid::Uuid;
 
-/// Two-tier read cache sitting in front of [`crate::store::Store`], as laid
-/// out in `api_reference.md`:
+/// Two-tier read cache sitting in front of [`crate::db::Db`], as laid out in
+/// `api_reference.md`:
 ///
 /// ```text
 /// L1 (hot, single slot) -> L2 (warm, hashmap) -> DB
 /// ```
 ///
 /// Both tiers cache the already-serialized JSON response body, so a hit
-/// never touches the store or `sonic_rs` again.
+/// never touches the DB or `sonic_rs` again.
 pub struct Cache {
     hot: ArcSwapOption<HotEntry>,
     warm: ArcSwap<WarmMap>,
@@ -24,6 +24,15 @@ pub struct Cache {
 struct HotEntry {
     id: Uuid,
     body: Bytes,
+}
+
+/// What a task wants done - `FillL1`/`Write` from `api_reference.md`'s
+/// `cache.send_task(...)` calls.
+pub enum CacheTask {
+    FillL1(Uuid, Bytes),
+    /// DB hit: fill both tiers ("FillAll" in the diagram).
+    Write(Uuid, Bytes),
+    Invalidate(Uuid),
 }
 
 // The fold below already spreads a random UUID over the full u64 range, so
@@ -56,15 +65,34 @@ impl Cache {
         (*stored_id == id).then(|| body.clone())
     }
 
-    /// L2 hit: promote straight to L1. This is a plain atomic pointer store,
-    /// not I/O, so unlike the DB path there's nothing to hand off - it just
-    /// happens inline before the response goes out.
-    pub fn promote(&self, id: Uuid, body: Bytes) {
+    /// Dispatches a cache write as its own task and calls `continuation`
+    /// once it lands - `cache.send_task(Task::Write(id, value), |_| {})`
+    /// from `api_reference.md`. This is a plain atomic pointer/map swap, no
+    /// I/O involved, but it still gets its own task rather than running
+    /// inline on the response path: the point isn't speed here, it's that
+    /// filling the cache is *not* the caller's problem, exactly like the
+    /// diagram draws it as a separate branch off to the side of `answer`.
+    pub fn send_task<F>(self: &Arc<Self>, task: CacheTask, continuation: F)
+    where
+        F: FnOnce(()) + 'static,
+    {
+        let cache = Arc::clone(self);
+        compio::runtime::spawn(async move {
+            match task {
+                CacheTask::FillL1(id, body) => cache.promote(id, body),
+                CacheTask::Write(id, body) => cache.fill(id, body),
+                CacheTask::Invalidate(id) => cache.invalidate(id),
+            }
+            continuation(());
+        })
+        .detach();
+    }
+
+    fn promote(&self, id: Uuid, body: Bytes) {
         self.hot.store(Some(Arc::new(HotEntry { id, body })));
     }
 
-    /// DB hit: fill both tiers ("FillAll" in `api_reference.md`).
-    pub fn fill(&self, id: Uuid, body: Bytes) {
+    fn fill(&self, id: Uuid, body: Bytes) {
         self.put_warm(id, body.clone());
         self.promote(id, body);
     }
@@ -75,9 +103,9 @@ impl Cache {
         self.warm.store(Arc::new(next));
     }
 
-    /// Drop any cached response for `id` from both tiers. Used on PATCH/DELETE
-    /// so a stale body can never outlive the write that invalidated it.
-    pub fn invalidate(&self, id: Uuid) {
+    /// Drops any cached response for `id` from both tiers, so a stale body
+    /// can never outlive the write that invalidated it.
+    fn invalidate(&self, id: Uuid) {
         if matches!(self.hot.load().as_deref(), Some(entry) if entry.id == id) {
             self.hot.store(None);
         }

@@ -8,21 +8,21 @@ use compio::io::{AsyncRead, AsyncWriteExt};
 use compio::net::{TcpListener, TcpSocket, TcpStream};
 use uuid::Uuid;
 
-use crate::cache::Cache;
+use crate::cache::{Cache, CacheTask};
+use crate::db::{Db, Task, TaskResult};
 use crate::http::{self, Method};
-use crate::store::Store;
 use crate::types::{CreateTodo, ErrorResp, PatchTodo, Todo};
 
 pub struct AppState {
-    pub store: Store,
-    pub cache: Cache,
+    pub db: Db,
+    pub cache: Arc<Cache>,
 }
 
 impl AppState {
-    pub fn new() -> Self {
+    pub fn new(db: Db) -> Self {
         Self {
-            store: Store::new(),
-            cache: Cache::new(),
+            db,
+            cache: Arc::new(Cache::new()),
         }
     }
 }
@@ -153,20 +153,20 @@ async fn handle_connection(stream: TcpStream, state: Arc<AppState>) {
             Err(_) => return,
         };
 
-        let response = route(&head, &body, &state);
+        let response = route(&head, &body, &state).await;
         if conn.write_response(response).await.is_err() {
             return;
         }
     }
 }
 
-fn route(head: &http::Head, body: &[u8], state: &AppState) -> Vec<u8> {
+async fn route(head: &http::Head, body: &[u8], state: &Arc<AppState>) -> Vec<u8> {
     let path = head.path.split('?').next().unwrap_or("/");
 
     if path == "/todos" {
         return match head.method {
-            Method::Get => list_todos(state),
-            Method::Post => create_todo(body, state),
+            Method::Get => list_todos(state).await,
+            Method::Post => create_todo(body, state).await,
             _ => not_found(),
         };
     }
@@ -179,9 +179,9 @@ fn route(head: &http::Head, body: &[u8], state: &AppState) -> Vec<u8> {
             };
 
             return match head.method {
-                Method::Get => get_todo(id, state),
-                Method::Patch => patch_todo(id, body, state),
-                Method::Delete => delete_todo(id, state),
+                Method::Get => get_todo(id, state).await,
+                Method::Patch => patch_todo(id, body, state).await,
+                Method::Delete => delete_todo(id, state).await,
                 _ => not_found(),
             };
         }
@@ -190,13 +190,33 @@ fn route(head: &http::Head, body: &[u8], state: &AppState) -> Vec<u8> {
     not_found()
 }
 
-fn list_todos(state: &AppState) -> Vec<u8> {
-    let items = state.store.list();
-    let body = sonic_rs::to_vec(&items).unwrap_or_default();
-    http::json_response(200, &body, &[])
+/// Runs a DB task and waits for its answer. This is the bridge between
+/// `Db::send_task`'s callback style and the fact that an HTTP response has
+/// to go out on *this* request before we can read the next one: the
+/// continuation drops the result into a oneshot channel, and we await that
+/// channel here - not the task itself.
+async fn db_call(state: &Arc<AppState>, task: Task) -> TaskResult {
+    let (tx, rx) = flume::bounded(1);
+    state.db.send_task(task, move |result| {
+        let _ = tx.send(result);
+    });
+    rx.recv_async()
+        .await
+        .unwrap_or_else(|_| TaskResult::Error("db task dropped its reply channel".into()))
 }
 
-fn create_todo(body: &[u8], state: &AppState) -> Vec<u8> {
+async fn list_todos(state: &Arc<AppState>) -> Vec<u8> {
+    match db_call(state, Task::List).await {
+        TaskResult::Many(items) => {
+            let body = sonic_rs::to_vec(&items).unwrap_or_default();
+            http::json_response(200, &body, &[])
+        }
+        TaskResult::Error(message) => internal_error(&message),
+        _ => internal_error("unexpected db result for List"),
+    }
+}
+
+async fn create_todo(body: &[u8], state: &Arc<AppState>) -> Vec<u8> {
     let payload: CreateTodo = match sonic_rs::from_slice(body) {
         Ok(payload) => payload,
         Err(_) => return bad_request("invalid request body"),
@@ -206,35 +226,48 @@ fn create_todo(body: &[u8], state: &AppState) -> Vec<u8> {
         return bad_request("title must not be empty");
     }
 
-    let todo = state.store.insert(Todo::new(payload.title));
-    let encoded = sonic_rs::to_vec(&*todo).unwrap_or_default();
-    state.cache.fill(todo.id, Bytes::from(encoded.clone()));
+    match db_call(state, Task::Insert(Todo::new(payload.title))).await {
+        TaskResult::One(Some(todo)) => {
+            let encoded = Bytes::from(sonic_rs::to_vec(&*todo).unwrap_or_default());
+            state
+                .cache
+                .send_task(CacheTask::Write(todo.id, encoded.clone()), |_| {});
 
-    let location = format!("/todos/{}", todo.id);
-    http::json_response(201, &encoded, &[("Location", &location)])
+            let location = format!("/todos/{}", todo.id);
+            http::json_response(201, &encoded, &[("Location", &location)])
+        }
+        TaskResult::Error(message) => internal_error(&message),
+        _ => internal_error("unexpected db result for Insert"),
+    }
 }
 
-fn get_todo(id: Uuid, state: &AppState) -> Vec<u8> {
+async fn get_todo(id: Uuid, state: &Arc<AppState>) -> Vec<u8> {
     if let Some(body) = state.cache.get_hot(id) {
         return http::json_response(200, &body, &[]);
     }
 
     if let Some(body) = state.cache.get_warm(id) {
-        state.cache.promote(id, body.clone());
+        state
+            .cache
+            .send_task(CacheTask::FillL1(id, body.clone()), |_| {});
         return http::json_response(200, &body, &[]);
     }
 
-    match state.store.get(id) {
-        Some(todo) => {
+    match db_call(state, Task::Get(id)).await {
+        TaskResult::One(Some(todo)) => {
             let encoded = Bytes::from(sonic_rs::to_vec(&*todo).unwrap_or_default());
-            state.cache.fill(id, encoded.clone());
+            state
+                .cache
+                .send_task(CacheTask::Write(id, encoded.clone()), |_| {});
             http::json_response(200, &encoded, &[])
         }
-        None => not_found(),
+        TaskResult::One(None) => not_found(),
+        TaskResult::Error(message) => internal_error(&message),
+        _ => internal_error("unexpected db result for Get"),
     }
 }
 
-fn patch_todo(id: Uuid, body: &[u8], state: &AppState) -> Vec<u8> {
+async fn patch_todo(id: Uuid, body: &[u8], state: &Arc<AppState>) -> Vec<u8> {
     let payload: PatchTodo = match sonic_rs::from_slice(body) {
         Ok(payload) => payload,
         Err(_) => return bad_request("invalid request body"),
@@ -246,25 +279,32 @@ fn patch_todo(id: Uuid, body: &[u8], state: &AppState) -> Vec<u8> {
         }
     }
 
-    match state.store.patch(id, payload.title, payload.completed) {
-        Some(todo) => {
+    match db_call(state, Task::Patch(id, payload.title, payload.completed)).await {
+        TaskResult::One(Some(todo)) => {
             let encoded = Bytes::from(sonic_rs::to_vec(&*todo).unwrap_or_default());
-            state.cache.fill(id, encoded.clone());
+            state
+                .cache
+                .send_task(CacheTask::Write(id, encoded.clone()), |_| {});
             http::json_response(200, &encoded, &[])
         }
-        None => {
-            state.cache.invalidate(id);
+        TaskResult::One(None) => {
+            state.cache.send_task(CacheTask::Invalidate(id), |_| {});
             not_found()
         }
+        TaskResult::Error(message) => internal_error(&message),
+        _ => internal_error("unexpected db result for Patch"),
     }
 }
 
-fn delete_todo(id: Uuid, state: &AppState) -> Vec<u8> {
-    if state.store.delete(id) {
-        state.cache.invalidate(id);
-        http::empty_response(204)
-    } else {
-        not_found()
+async fn delete_todo(id: Uuid, state: &Arc<AppState>) -> Vec<u8> {
+    match db_call(state, Task::Delete(id)).await {
+        TaskResult::Deleted(true) => {
+            state.cache.send_task(CacheTask::Invalidate(id), |_| {});
+            http::empty_response(204)
+        }
+        TaskResult::Deleted(false) => not_found(),
+        TaskResult::Error(message) => internal_error(&message),
+        _ => internal_error("unexpected db result for Delete"),
     }
 }
 
@@ -276,4 +316,9 @@ fn not_found() -> Vec<u8> {
 fn bad_request(message: &str) -> Vec<u8> {
     let body = sonic_rs::to_vec(&ErrorResp::invalid(message)).unwrap_or_default();
     http::json_response(400, &body, &[])
+}
+
+fn internal_error(message: &str) -> Vec<u8> {
+    let body = sonic_rs::to_vec(&ErrorResp::internal(message)).unwrap_or_default();
+    http::json_response(500, &body, &[])
 }

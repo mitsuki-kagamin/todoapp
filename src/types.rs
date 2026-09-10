@@ -43,6 +43,7 @@ pub struct PatchTodo {
 pub enum ErrorCode {
     TodoNotFound,
     InvalidRequest,
+    InternalError,
 }
 
 #[derive(Serialize)]
@@ -70,6 +71,15 @@ impl ErrorResp {
         Self {
             error: ErrorBody {
                 code: ErrorCode::InvalidRequest,
+                message: message.into(),
+            },
+        }
+    }
+
+    pub fn internal(message: impl Into<String>) -> Self {
+        Self {
+            error: ErrorBody {
+                code: ErrorCode::InternalError,
                 message: message.into(),
             },
         }
