@@ -106,7 +106,7 @@ impl Conn {
         loop {
             match http::try_parse(&self.buf) {
                 Ok(Some(head)) => {
-                    self.buf.drain(..head.head_len);
+                    self.buf.drain(..head.head_len());
                     return Ok(Some(head));
                 }
                 Ok(None) => {
@@ -157,7 +157,7 @@ async fn handle_connection(stream: TcpStream, state: Arc<AppState>) {
             Err(_) => return,
         };
 
-        let body = match conn.read_body(head.content_length).await {
+        let body = match conn.read_body(head.content_length()).await {
             Ok(body) => body,
             Err(_) => return,
         };
@@ -170,10 +170,17 @@ async fn handle_connection(stream: TcpStream, state: Arc<AppState>) {
 }
 
 async fn route(head: &http::Head, body: &[u8], state: &Arc<AppState>, out: &mut Vec<u8>) {
-    let path = head.path.split('?').next().unwrap_or("/");
+    // The one shape the hot loop actually takes never touches httparse or a
+    // generic route match at all - see `http::try_fast_get_todo`.
+    let general = match head {
+        http::Head::FastGetTodo { id, .. } => return get_todo(id, state, out).await,
+        http::Head::General(g) => g,
+    };
+
+    let path = general.path.split('?').next().unwrap_or("/");
 
     if path == "/todos" {
-        return match head.method {
+        return match general.method {
             Method::Get => list_todos(state, out).await,
             Method::Post => create_todo(body, state, out).await,
             _ => not_found(out),
@@ -185,16 +192,16 @@ async fn route(head: &http::Head, body: &[u8], state: &Arc<AppState>, out: &mut 
             // GET checks the raw path bytes against L1 before parsing
             // anything - see `Cache::get_hot_raw`. PATCH/DELETE always need
             // a real `Uuid` for the DB call, so they parse up front.
-            if head.method == Method::Get {
-                return get_todo(rest, state, out).await;
+            if general.method == Method::Get {
+                return get_todo(rest.as_bytes(), state, out).await;
             }
 
-            let id = match parse_uuid_fast(rest) {
+            let id = match parse_uuid_fast(rest.as_bytes()) {
                 Some(id) => id,
                 None => return bad_request(out, "id must be a valid UUID"),
             };
 
-            return match head.method {
+            return match general.method {
                 Method::Patch => patch_todo(id, body, state, out).await,
                 Method::Delete => delete_todo(id, state, out).await,
                 _ => not_found(out),
@@ -211,8 +218,7 @@ async fn route(head: &http::Head, body: &[u8], state: &Arc<AppState>, out: &mut 
 /// variants we never see here, since every id in this API comes straight out
 /// of a URL path or one of our own responses.
 #[inline]
-fn parse_uuid_fast(s: &str) -> Option<Uuid> {
-    let b = s.as_bytes();
+fn parse_uuid_fast(b: &[u8]) -> Option<Uuid> {
     if b.len() != 36 {
         return None;
     }
@@ -298,17 +304,17 @@ async fn create_todo(body: &[u8], state: &Arc<AppState>, out: &mut Vec<u8>) {
     }
 }
 
-async fn get_todo(id_str: &str, state: &Arc<AppState>, out: &mut Vec<u8>) {
+async fn get_todo(id_bytes: &[u8], state: &Arc<AppState>, out: &mut Vec<u8>) {
     // Straight memcmp against the raw path bytes, no hex decode - see
     // `Cache::get_hot_raw`. This is the path every request on `test.js`
     // takes after the first.
-    let hot = state.cache.get_hot_raw(id_str);
+    let hot = state.cache.get_hot_raw(id_bytes);
     if std::hint::likely(hot.is_some()) {
         http::write_json_response(out, 200, &hot.unwrap(), &[]);
         return;
     }
 
-    let id = match parse_uuid_fast(id_str) {
+    let id = match parse_uuid_fast(id_bytes) {
         Some(id) => id,
         None => return bad_request(out, "id must be a valid UUID"),
     };

@@ -7,21 +7,113 @@ pub enum Method {
     Other,
 }
 
-/// A fully parsed request line + headers. The body (if any) is read
-/// separately once `content_length` is known.
-pub struct Head {
+/// A parsed request head. `FastGetTodo` is the one shape the hot loop
+/// actually takes (`GET /todos/<uuid> HTTP/1.1\r\n...\r\n\r\n`) and skips
+/// httparse entirely for it; everything else goes through `General`, which
+/// is the same httparse-based parse as before.
+pub enum Head {
+    FastGetTodo { id: [u8; 36], head_len: usize },
+    General(GeneralHead),
+}
+
+pub struct GeneralHead {
     pub method: Method,
     pub path: String,
     pub content_length: usize,
-    /// Bytes the head occupied in the source buffer, so the caller can drain
-    /// exactly that much and keep the rest (body, or the next pipelined
-    /// request) around.
     pub head_len: usize,
+}
+
+impl Head {
+    pub fn head_len(&self) -> usize {
+        match self {
+            Head::FastGetTodo { head_len, .. } => *head_len,
+            Head::General(g) => g.head_len,
+        }
+    }
+
+    /// A `FastGetTodo` never reaches this state with a body: the fast path
+    /// bails out to the general parser the moment it sees a Content-Length
+    /// header at all (see `header_block_has_content_length`), so `0` here is
+    /// never a guess - it's the only way this variant gets constructed.
+    pub fn content_length(&self) -> usize {
+        match self {
+            Head::FastGetTodo { .. } => 0,
+            Head::General(g) => g.content_length,
+        }
+    }
+}
+
+const FAST_PREFIX: &[u8] = b"GET /todos/";
+const FAST_SUFFIX: &[u8] = b" HTTP/1.1\r\n";
+const FAST_ID_LEN: usize = 36;
+const FAST_LINE_LEN: usize = FAST_PREFIX.len() + FAST_ID_LEN + FAST_SUFFIX.len();
+
+enum FastResult {
+    Matched { id: [u8; FAST_ID_LEN], head_len: usize },
+    NeedMore,
+    NotThisShape,
+}
+
+/// Checks for the literal `GET /todos/<36 bytes> HTTP/1.1\r\n` request line
+/// and, if present, just enough of the header block to know it's safe to
+/// skip parsing it: no Content-Length means no body means nothing to lose by
+/// not reading the headers at all beyond finding where they end.
+fn try_fast_get_todo(buf: &[u8]) -> FastResult {
+    if buf.len() < FAST_PREFIX.len() {
+        return FastResult::NeedMore;
+    }
+    if &buf[..FAST_PREFIX.len()] != FAST_PREFIX {
+        return FastResult::NotThisShape;
+    }
+    if buf.len() < FAST_LINE_LEN {
+        return FastResult::NeedMore;
+    }
+    if &buf[FAST_PREFIX.len() + FAST_ID_LEN..FAST_LINE_LEN] != FAST_SUFFIX {
+        return FastResult::NotThisShape;
+    }
+
+    let mut id = [0u8; FAST_ID_LEN];
+    id.copy_from_slice(&buf[FAST_PREFIX.len()..FAST_PREFIX.len() + FAST_ID_LEN]);
+
+    match find_double_crlf(&buf[FAST_LINE_LEN..]) {
+        Some(rel) => {
+            let headers = &buf[FAST_LINE_LEN..FAST_LINE_LEN + rel];
+            if header_block_has_content_length(headers) {
+                // A GET with a body-bearing header is unusual enough that
+                // it's not worth optimizing for - and silently ignoring the
+                // header would desync the next pipelined request off
+                // whatever body bytes follow it. Let the general parser
+                // handle it correctly instead.
+                FastResult::NotThisShape
+            } else {
+                FastResult::Matched {
+                    id,
+                    head_len: FAST_LINE_LEN + rel + 4,
+                }
+            }
+        }
+        None => FastResult::NeedMore,
+    }
+}
+
+fn find_double_crlf(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
+fn header_block_has_content_length(headers: &[u8]) -> bool {
+    const NAME: &[u8] = b"content-length";
+    headers.windows(NAME.len()).any(|w| w.eq_ignore_ascii_case(NAME))
 }
 
 /// Tries to parse a request head out of `buf`. `Ok(None)` means the head
 /// isn't fully buffered yet and the caller should read more and retry.
 pub fn try_parse(buf: &[u8]) -> Result<Option<Head>, httparse::Error> {
+    match try_fast_get_todo(buf) {
+        FastResult::Matched { id, head_len } => return Ok(Some(Head::FastGetTodo { id, head_len })),
+        FastResult::NeedMore => return Ok(None),
+        FastResult::NotThisShape => {}
+    }
+
     let mut headers = [httparse::EMPTY_HEADER; 16];
     let mut req = httparse::Request::new(&mut headers);
 
@@ -45,12 +137,12 @@ pub fn try_parse(buf: &[u8]) -> Result<Option<Head>, httparse::Error> {
                 .and_then(|v| v.trim().parse::<usize>().ok())
                 .unwrap_or(0);
 
-            Ok(Some(Head {
+            Ok(Some(Head::General(GeneralHead {
                 method,
                 path,
                 content_length,
                 head_len,
-            }))
+            })))
         }
         httparse::Status::Partial => Ok(None),
     }

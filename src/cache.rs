@@ -64,15 +64,16 @@ impl Cache {
         }
     }
 
-    /// L1 check straight off the raw path bytes - `id_str` is expected to be
-    /// the 36-byte canonical form, but any mismatch (including a
+    /// L1 check straight off the raw path bytes - `id_bytes` is expected to
+    /// be the 36-byte canonical form, but any mismatch (including a
     /// differently-cased or malformed id) just misses here and falls
     /// through to the parsed-`Uuid` path below, which is the one place that
-    /// actually validates the format.
-    pub fn get_hot_raw(&self, id_str: &str) -> Option<Bytes> {
+    /// actually validates the format. Takes raw bytes rather than `&str` so
+    /// callers never pay for UTF-8 validation just to compare bytes.
+    pub fn get_hot_raw(&self, id_bytes: &[u8]) -> Option<Bytes> {
         let guard = self.hot.load();
         let entry = guard.as_deref()?;
-        (entry.id_ascii.as_slice() == id_str.as_bytes()).then(|| entry.body.clone())
+        (entry.id_ascii.as_slice() == id_bytes).then(|| entry.body.clone())
     }
 
     pub fn get_warm(&self, id: Uuid) -> Option<Bytes> {
