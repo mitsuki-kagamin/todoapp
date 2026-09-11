@@ -75,6 +75,31 @@ exactly the expected shape: at depth >= 4 the ring never sleeps (`voluntary_ctxt
 0), so there are no deferrable completions and the flag has nothing to give. it pays precisely
 where completions arrive sparsely.
 
+### bespoke io_uring loop (S1, work in progress)
+
+`src/bin/uring.rs` replaces the runtime rather than the ring: no `Future`, no waker, no
+executor, connection state in a slot indexed by fd, `user_data` carrying (tag, generation, fd)
+so nothing is allocated per operation. compio costs 2 `malloc`/`free` pairs, ~8 locked RMWs,
+4 SipHashes of a pointer and ~3 task polls per request; this costs none of them.
+
+Measured against the compio server, one server at a time, 5 randomized rounds, medians:
+
+```
+              user CPU/req       kernel     total      RPS
+compio        1.15 us            7.40 us    8.67 us    187k
+uring (S1)    0.39 us            7.30 us    7.59 us    219k
+```
+
+**Userspace is the result that survives the noise**: 1.15-1.27 us against 0.29-0.46 us, ranges
+that do not overlap at all. **The RPS difference is not established** - those distributions
+(187-240k vs 172-232k) overlap almost completely, and this host is too noisy today to resolve a
+~10% throughput difference. Kernel time is unchanged, which is what should happen: same ring
+mechanics, different userspace.
+
+Note on absolute numbers: this container moved to a different host CPU partway through (a
+`target-cpu=native` binary SIGILLed, which is how it was noticed). Numbers are only comparable
+within a block measured together; every table here is.
+
 the remaining per-request cost is the TCP/loopback packet path, which is ~2 softirqs and ~1.6 us
 per io_uring op regardless of payload size up to ~10 KB. userspace is now 16% of the total rather
 than 10%, so it is worth more than it was.
