@@ -4,21 +4,21 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-chrono = { version = "0.4.45", features = ["serde"] }
 arc-swap = "1.9.2"
 hashbrown = "0.17.1"
 mimalloc = "0.1.52"
 sonic-rs = "0.5.8"
 bytes = "1.12.1"
 nohash-hasher = "0.2.0"
+memchr = "2"
 serde = { version = "1", features = ["derive"] }
-uuid = { version = "1", features = ["v4", "serde"] }
+uuid = { version = "1", features = ["v4"] }
 httparse = "1.10"
 itoa = "1"
 compio = { version = "0.19.2", features = ["macros", "net", "io", "runtime", "bytes"] }
 flume = "0.12.0"
 dotenvy = "0.15.7"
-postgres = { version = "0.19.14", features = ["with-uuid-1", "with-chrono-0_4"] }
+postgres = { version = "0.19.14", features = ["with-uuid-1"] }
 r2d2 = "0.8.10"
 r2d2_postgres = "0.18.2"
 
