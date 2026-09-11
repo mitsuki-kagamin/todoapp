@@ -21,6 +21,8 @@ dotenvy = "0.15.7"
 postgres = { version = "0.19.14", features = ["with-uuid-1"] }
 r2d2 = "0.8.10"
 r2d2_postgres = "0.18.2"
+io-uring = "0.7"
+libc = "0.2.189"
 
 [profile.release]
 opt-level = 3

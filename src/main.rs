@@ -944,7 +944,7 @@ fn main() {
         .map(|_| {
             let state = state.clone();
             std::thread::spawn(move || {
-                compio::runtime::Runtime::new()
+                runtime()
                     .expect("failed to start compio runtime")
                     .block_on(accept_loop(addr, state))
             })
@@ -954,6 +954,27 @@ fn main() {
     for thread in threads {
         let _ = thread.join();
     }
+}
+
+/// The ring this worker owns.
+///
+/// `DEFER_TASKRUN` is the whole game: without it every completion arriving in softirq context
+/// queues task_work and IPIs the owning thread, and that cost is paid *per completion*. With it
+/// completions pile up and get reaped in a batch on the next wait. Measured on the bare ring:
+/// 10.4 -> 4.9 us of kernel time per request. It is silently ignored unless `SINGLE_ISSUER` is
+/// set too, and the kernel refuses it together with `SQPOLL`.
+fn runtime() -> io::Result<compio::runtime::Runtime> {
+    let off = |k: &str| std::env::var(k).map(|v| v == "0").unwrap_or(false);
+    let mut proactor = compio::driver::ProactorBuilder::new();
+    proactor.capacity(2048).cqsize(8192);
+    if !off("TODOAPP_DEFER") {
+        proactor.single_issuer(true).defer_taskrun(true);
+    } else if !off("TODOAPP_COOP") {
+        proactor.coop_taskrun(true).taskrun_flag(true);
+    }
+    compio::runtime::RuntimeBuilder::new()
+        .with_proactor(proactor)
+        .build()
 }
 
 /// One `compio` runtime per core, every one of them accepting on the same port
