@@ -5,19 +5,22 @@ and 520 (idk) -- 528k RPS ([kotlin](https://github.com/qmained/todo-project))
 
 ---
 
-status: alive again. one file, on [compio](https://github.com/compio-rs/compio) (io_uring, thread-per-core via
-`SO_REUSEPORT`), implementing the L1 (hot slot) -> L2 (warm map) -> DB pipeline from `api_reference.md` as
-actual dispatched tasks/continuations (`Db::send_task` / `Cache::send_task`), not flattened into `.await`s.
-needs nightly (`compio-executor` uses `cfg_select`, pinned via `rust-toolchain.toml`).
-the 527k number at the top is stale (different box, all cores); see the measured table below.
+status: alive again, and off compio. One file, a hand-rolled io_uring event loop -- no `Future`,
+no waker, no executor -- thread-per-core via `SO_REUSEPORT`, implementing the L1 -> L2 -> DB
+pipeline from `api_reference.md` as real dispatched tasks and continuations, not flattened into
+`.await`s. Builds on **stable** now; nightly was only ever needed because compio was.
 
-`GET /todos/{id}` is specialised end to end: the request line is recognised by memcmp against the literal
-`GET /todos/<36 bytes> HTTP/1.1\r\n` (httparse only handles what doesn't match), the id is compared as raw
-ASCII with no hex decode, and both cache tiers hold the **entire precomputed HTTP response** - so a hit is one
-atomic load, one 36-byte compare and one write. Every error response is precomputed too.
+DB tier is real Postgres (`postgres` + `r2d2`, schema auto-migrated on boot) behind a blocking
+thread pool, with replies returning to the owning worker through an eventfd. Set `POSTGRES_URL`
+(env or `.env`). Listens on `127.0.0.1:8080` by default, which is what `test.js` expects; override
+with `TODOAPP_ADDR`.
 
-DB tier is real Postgres (`postgres` + `r2d2`, schema auto-migrated on boot). Set `POSTGRES_URL`
-(env or `.env`, e.g. `postgresql://user:pass@localhost:5432/todoapp`) before running.
+`GET /todos/{id}` is specialised end to end: the request line is recognised by memcmp against the
+literal `GET /todos/<36 bytes> HTTP/1.1\r\n`, the id is compared as raw ASCII with no hex decode,
+and both cache tiers hold the **entire precomputed HTTP response**. On top of that each worker
+keeps a one-entry mirror of the last request it answered, so a byte-identical repeat skips the
+parse and both cache tiers entirely -- guarded by a global version counter bumped before any
+mutating response goes out.
 
 ### where the time actually goes
 
@@ -77,32 +80,48 @@ where completions arrive sparsely.
 
 ### bespoke io_uring loop
 
-`src/bin/uring.rs` replaces the runtime, not the ring: no `Future`, no waker, no executor,
-connection state in a slot indexed by fd, `user_data` carrying (tag, generation, fd) so nothing
-is allocated per operation. compio spent 2 `malloc`/`free` pairs, ~8 locked RMWs, 4 SipHashes of
-a pointer and ~3 task polls on every request just to get to the same place.
-
-`send_task(Task, continuation)` from `api_reference.md` is finally what it wants to be: a
-continuation is a plain enum value parked in the connection's slot, dispatching one is pushing a
-small value onto a queue. Through compio the same shape had to be threaded through oneshot
-channels, and that was part of what it cost.
+Replaces the runtime, not the ring: connection state in a slot indexed by fd, `user_data`
+carrying (tag, generation, fd), so nothing is allocated per operation. compio spent 2
+`malloc`/`free` pairs, ~8 locked RMWs, 4 SipHashes of a pointer and ~3 task polls on every
+request to get to the same place. `send_task(Task, continuation)` is finally what it wants to
+be: a continuation is a plain enum value parked in the connection's slot, dispatching one is
+pushing a small value onto a queue.
 
 Measured one server at a time, 6 randomized rounds, medians:
 
 ```
               user CPU/req          kernel   total    RPS
 compio        1.11 us (1.07-1.19)   7.32 us  8.43 us  206k
-uring         0.50 us (0.42-0.55)   6.87 us  7.34 us  208k
+bespoke loop  0.50 us (0.42-0.55)   6.87 us  7.34 us  208k
 ```
 
-**Userspace is the result that survives the noise**: those ranges do not overlap. Total cost per
-request falls 13%. **The RPS difference is not established** - 197-240k against 183-229k overlap
-completely, and this host cannot resolve a ~10% throughput difference. Kernel time is unchanged,
-which is what should happen: same ring mechanics, different userspace.
+and the per-worker speculation mirror on top of that, its own 6 randomized rounds:
+
+```
+              user CPU/req
+mirror off    0.54 us (0.51-0.58)
+mirror on     0.42 us (0.37-0.42)
+```
+
+**Userspace is the result that survives the noise** -- none of those ranges overlap.
+**Neither RPS difference is established**: the distributions overlap almost completely, and this
+host cannot resolve ~10% of throughput. Kernel time is unchanged throughout, which is what should
+happen: same ring mechanics, different userspace.
+
+Pipelining, same stand, shows what the single-send batching does -- every complete request in a
+read is answered in one `send`:
+
+```
+depth  1    201k RPS   6.79 us/req   2.00 softirq/req
+depth  2    826k        1.69          0.50
+depth  4    2.9M        0.45          0.13
+depth  8    9.8M        0.13          0.03
+depth 16   32.0M        0.04          0.01
+```
 
 Note on absolute numbers: this container moved to a different host CPU partway through the work
-(a `target-cpu=native` binary SIGILLed, which is how it was noticed), so figures are only
-comparable within a block measured together. Every table here is.
+(a `target-cpu=native` binary SIGILLed, which is how it was noticed), and the host is noisy.
+Figures are only comparable within a block measured together. Every table here is.
 
 the remaining per-request cost is the TCP/loopback packet path, which is ~2 softirqs and ~1.6 us
 per io_uring op regardless of payload size up to ~10 KB. userspace is now 16% of the total rather
